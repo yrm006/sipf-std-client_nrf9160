@@ -8,6 +8,9 @@
 
 #include <net/net_ip.h>
 #include <net/socket.h>
+#include <fcntl.h>
+#include <net/http_client.h>
+#include <net/net_core.h>
 #include <net/tls_credentials.h>
 #include <sys/base64.h>
 #include <logging/log.h>
@@ -16,6 +19,7 @@ LOG_MODULE_DECLARE(sipf);
 
 #include "sipf/sipf_client_http.h"
 #include "sipf/sipf_object.h"
+#include "sys/reboot.h"
 
 #define HTTP_BASIC_AUTH_HEADER_PREFIX "Authorization: Basic "
 #define NEWLINE_STRING "\r\n"
@@ -24,6 +28,85 @@ uint8_t httpc_req_buff[BUFF_SZ];
 uint8_t httpc_res_buff[BUFF_SZ];
 
 static char req_auth_header[256];
+
+
+
+int PATCH_http_client_req(int sock, struct http_request *req,
+		    int32_t timeout, void *user_data);
+
+
+
+//---
+typedef struct{
+    char host[256];
+    struct zsock_addrinfo* res;
+} addrinfo_map;
+
+static
+addrinfo_map PATCH_map[8] = {};
+
+static
+struct zsock_addrinfo* PATCH_map_find(const char* host)
+{
+    int i=0;
+    while(i < sizeof(PATCH_map)/sizeof(PATCH_map[0])){
+        if( strcmp(PATCH_map[i].host, host) == 0 ){
+            return PATCH_map[i].res;
+        }
+        ++i;
+    }
+
+    return NULL;
+}
+
+static
+void PATCH_map_add(const char* host, struct zsock_addrinfo* res)
+{
+    int i=0;
+    while(i < sizeof(PATCH_map)/sizeof(PATCH_map[0])){
+        if( PATCH_map[i].host[0] == 0 ){
+            strcpy(PATCH_map[i].host, host);
+            PATCH_map[i].res = res;
+            break;
+        }
+        ++i;
+    }
+}
+
+static
+int PATCH_getaddrinfo(const char *host, const char *service,
+		      const struct zsock_addrinfo *hints,
+		      struct zsock_addrinfo **res)
+{
+    if( (*res = PATCH_map_find(host)) ){
+        return 0;
+    }else{
+        int r = getaddrinfo(host, service, hints, res);
+        PATCH_map_add(host, *res);
+        return r;
+    }
+}
+
+static
+void PATCH_freeaddrinfo(struct zsock_addrinfo *ai)
+{
+    int i=0;
+    while(i < sizeof(PATCH_map)/sizeof(PATCH_map[0])){
+        if( PATCH_map[i].res == ai ){
+            break;
+        }
+        ++i;
+    }
+
+    if(i < sizeof(PATCH_map)/sizeof(PATCH_map[0])){
+        // none
+    }else{
+        freeaddrinfo(ai);
+    }
+}
+//---//
+
+
 
 /* Setup TLS options on a given socket */
 static int tls_setup(int fd, const char *host_name)
@@ -147,7 +230,7 @@ int SipfClientHttpRunRequest(const char *hostname, struct http_request *req, uin
         .ai_family = AF_INET, .ai_socktype = SOCK_STREAM,
     };
     // 接続先をセットアップするよ
-    ret = getaddrinfo(hostname, NULL, &hints, &res);
+    ret = PATCH_getaddrinfo(hostname, NULL, &hints, &res);
     if (ret) {
         LOG_ERR("getaddrinfo failed: ret=%d errno=%d", ret, errno);
         return -errno;
@@ -161,7 +244,7 @@ int SipfClientHttpRunRequest(const char *hostname, struct http_request *req, uin
     }
     if (sock < 0) {
         LOG_ERR("socket() failed: ret=%d errno=%d", ret, errno);
-        freeaddrinfo(res);
+        PATCH_freeaddrinfo(res);
         return -errno;
     }
     if (tls) {
@@ -169,23 +252,44 @@ int SipfClientHttpRunRequest(const char *hostname, struct http_request *req, uin
         ret = tls_setup(sock, hostname);
         if (ret != 0) {
             LOG_ERR("tls_setup() failed: ret=%d", ret);
-            freeaddrinfo(res);
+            PATCH_freeaddrinfo(res);
             (void)close(sock);
             return -errno;
         }
     }
     // 接続するよ
     LOG_INF("Connect to %s:%d", hostname, HTTPS_PORT);
-    ret = connect(sock, res->ai_addr, sizeof(struct sockaddr_in));
-    if (ret) {
-        LOG_ERR("connect() failed: ret=%d errno=%d", ret, errno);
-        freeaddrinfo(res);
-        (void)close(sock);
-        return -errno;
+
+    int oldfl;
+    oldfl = fcntl(sock, F_GETFL);
+    fcntl(sock, F_SETFL, oldfl | O_NONBLOCK);
+
+    ret = 1;
+
+    connect(sock, res->ai_addr, sizeof(struct sockaddr_in));
+
+    fd_set fdset;
+    FD_ZERO(&fdset);
+    FD_SET(sock, &fdset);
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+
+    int s = select(sock + 1, NULL, &fdset, NULL, &tv);
+    if (s == 1){
+        ret = 0;
+        fcntl(sock, F_SETFL, oldfl);
     }
 
-    ret = http_client_req(sock, req, timeout, http_res);
-    freeaddrinfo(res);
+    if (ret) {
+        sys_reboot(SYS_REBOOT_WARM);
+    }
+
+    ret = PATCH_http_client_req(sock, req, timeout, http_res);
+    if(ret < 0){
+        sys_reboot(SYS_REBOOT_WARM);
+    }
+    PATCH_freeaddrinfo(res);
     close(sock);
     return ret;
 }

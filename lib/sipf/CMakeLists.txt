@@ -12,4 +12,5 @@ zephyr_library_sources_ifdef(CONFIG_SIPF
 	src/sipf_auth.c
     src/sipf_object.c
 	src/sipf_file.c
+    src/PATCH_http_client.c
 )
