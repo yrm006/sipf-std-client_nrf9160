@@ -57,7 +57,7 @@ static CmdResponse *stateBufferingAscii(uint8_t b)
     } else {
         // バッファに追加
         in_buff[in_buff_idx++] = b;
-        if (in_buff_idx > sizeof(in_buff)) {
+        if (in_buff_idx >= sizeof(in_buff)) {
             // バッファオーバー
             state = CMD_STATE_WAIT;
             LOG_ERR("CMD BUFFER FULL");
